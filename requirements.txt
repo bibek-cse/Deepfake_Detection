@@ -1,0 +1,10 @@
+torch
+timm
+scikit-learn
+matplotlib
+seaborn
+opencv-python
+Pillow
+tqdm
+numpy
+kagglehub # For dataset download scripts 
