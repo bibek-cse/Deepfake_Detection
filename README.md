@@ -132,7 +132,7 @@ python -c "from Dataset.Deepfake_Dataset import download_deepfake_dataset; downl
 
 Clone the repository and install dependencies:
 ```bash
-git clone <repository_url> # Replace with your repo URL
+git clone https://github.com/bibek-cse/Deepfake_Detection.git
 cd deepfake-detection-toolkit
 pip install -r requirements.txt
 ```
