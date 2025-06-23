@@ -1,6 +1,15 @@
-# Deepfake Detection Models
+# Deepfake Detection Models Toolkit
 
-This project provides a collection of deepfake detection models implemented in Python. It allows users to easily evaluate their datasets against various models to detect deepfake images or videos.
+This project provides a Python-based toolkit for training, evaluating, and analyzing deepfake detection models. It separates concerns into dedicated modules for Data Handling, Model Implementations, and shared Utilities.
+
+The `main.py` script acts as the central command-line interface, allowing you to select a model and dataset path to run a full pipeline. The pipeline typically involves:
+1.  Loading and splitting your dataset into training, validation, and test sets using a specified dataset loader module.
+2.  Setting up the selected model (potentially loading pre-trained weights).
+3.  Training the model on the training data.
+4.  Evaluating the model on the validation set during training (if validation data is available) and saving the best model weights.
+5.  Loading the best (or last epoch's) model.
+6.  Performing comprehensive evaluation on the test set.
+7.  Displaying detailed metrics and generating visualizations (Confusion Matrix, ROC/PR Curves, Grad-CAM, t-SNE) using utility functions.
 
 ---
 
@@ -69,23 +78,29 @@ model_map = {
 
 ## Project Structure 
 ```
+deepfake-detection-toolkit/
 ├── Detection/
-│   ├── __init__.py          # Makes Detection a Python package
-│   ├── XceptionNet.py       # Placeholder for XceptionNet implementation
-│   ├── InceptionNet.py      # Placeholder for InceptionNet implementation
-│   ├── ResNet50.py          # Placeholder for ResNet50 implementation
-│   ├── EfficientNet.py      # Placeholder for EfficientNet implementation
-│   ├── MesoNet.py           # Placeholder for MesoNet implementation
-│   ├── ConvxNet.py          # Placeholder for ConvxNet implementation
-│   ├── InceptionResNetV2.py # Implementation for InceptionResNetV2 (full pipeline)
+│   ├── __init__.py             
+│   ├── XceptionNet.py          
+│   ├── InceptionNet.py       
+│   ├── ResNet50.py           
+│   ├── EfficientNet.py        
+│   ├── MesoNet.py             
+│   ├── ConvxNet.py            
+│   ├── InceptionResNetV2.py   
 ├── Dataset/
-|   ├── __init__.py          # Makes Dataset a Python package
-|   ├── Celeb_DF_v2.py       # Script to download Celeb_DF_v2 (videos)
-|   ├── Deepfake_Dataset.py  # Placeholder for Deepfake_Dataset download/loader
-|   ├── utils.py             # Placeholder for dataset-specific utilities (e.g., frame extraction)
-├── main.py                  # Main script for model selection and execution
-├── requirements.txt         # List of Python dependencies
-└── README.md                # Project description and usage instructions (This file)
+│   ├── __init__.py             # To make Dataset a Python package
+│   ├── base_dataset.py         # Base classes/helpers for datasets (Optional but good)
+│   ├── Celeb_DF_v2.py          # Celeb-DF v2 specific loading/splitting
+│   ├── Deepfake_Dataset.py     
+├── Utility/
+│   ├── __init__.py             # To make Utility a Python package
+│   ├── plots.py                # Functions for generating plots (Conf matrix, ROC/PR, t-SNE)
+│   ├── gradcam_helper.py       # Grad-CAM class and visualization function
+│   ├── metrics.py              # Helpers Function for metrics if needed
+├── main.py
+├── requirements.txt
+└── README.md
 ```
 
 ---
@@ -108,6 +123,44 @@ python -c "from Dataset.Celeb_DF_v2 import download_celeb_df_v2; download_celeb_
 # Deepfake_Dataset
 python -c "from Dataset.Deepfake_Dataset import download_deepfake_dataset; download_deepfake_dataset()"
 ```
+
+---
+
+## Running the Toolkit
+
+### 1. Installation
+
+Clone the repository and install dependencies:
+```bash
+git clone <repository_url> # Replace with your repo URL
+cd deepfake-detection-toolkit
+pip install -r requirements.txt
+```
+### 2. Execute main.py
+```bash
+python main.py --model InceptionResNetV2 --dataset /path/to/your/prepared_dataset/
+```
+Replace /path/to/your/prepared_dataset/ with the actual path to your dataset folder containing real/ and fake/.
+
+Specifying a different dataset loader (if you created one or want to force a specific one):
+```
+python main.py --model InceptionResNetV2 --dataset /path/to/my_other_dataset/ --dataset-loader Deepfake_Dataset
+```
+This would run InceptionResNetV2 but use the load_and_split_data function from Dataset/Deepfake_Dataset.py.
+
+---
+
+## Output and Visualizations
+
+After running a model pipeline (e.g., for InceptionResNetV2), the script will print summaries of data loading, training progress (if training), validation metrics (if validation data exists), and final test metrics.
+
+It will then use the utility functions to generate plots in separate windows:
+* Confusion Matrix
+* ROC Curve and PR Curve
+* Grad-CAM visualization for a random test image
+* t-SNE visualization of test set features
+
+Inspect these plots to understand the model's performance and behavior. The confusion matrix and ROC/PR curves provide quantitative insights, while Grad-CAM and t-SNE offer qualitative understanding of where the model looks and how well it separates classes in its feature space.
 
 ---
 
