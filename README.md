@@ -138,7 +138,7 @@ pip install -r requirements.txt
 ```
 ### 2. Execute main.py
 ```bash
-python main.py --model InceptionResNetV2 --dataset /path/to/your/prepared_dataset/
+python main.py --model InceptionResNetV2 --dataset Dataset/Celeb_DF_v2.py --output ./test_output_inception_resnet_v2/
 ```
 Replace /path/to/your/prepared_dataset/ with the actual path to your dataset folder containing real/ and fake/.
 
