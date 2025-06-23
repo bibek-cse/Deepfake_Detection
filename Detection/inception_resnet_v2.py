@@ -1,259 +1,57 @@
-# -------------------- Inception-ResNetV2 Deepfake Detector (Comprehensive Pipeline) ---------------------------
+# Detection/InceptionResNetV2.py
 
 import os
-import glob
 import random
 import numpy as np
-from PIL import Image, ImageFile
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+# import torch.nn.functional as F # Not needed in this file anymore
+from torch.utils.data import DataLoader # Only needed for type hinting
 import timm
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix,
-    roc_curve, auc, precision_recall_curve, average_precision_score # Import metrics for AUC/PR
-)
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.manifold import TSNE
-import cv2
-import traceback
 import sys
-
-# Allow loading truncated images
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+# Import utility functions for feature extraction/evaluation within the model module if needed
+# from Utility.gradcam_helper import GradCAM # We'll handle GradCAM in main or a dedicated utility function called by main
+# from Utility.plots import visualize_cam, plot_confusion_matrix # These are called by main
 
 # --- Configuration ---
 class Config:
-    # These paths should ideally be passed or configured externally,
-    # but for this integration, we'll keep them here as defaults.
-    # NOTE: When running from main.py, dataset_path will be passed,
-    # but we still need to configure the subdirectories within that path.
-    # We will assume the dataset_path passed to test_model *is* the DATA_ROOT.
-    DATA_ROOT = None # Will be set by the dataset_path argument in test_model
-    REAL_DIR = 'real' # Assuming 'real' subfolder name based on main.py's expectation
-    FAKE_DIRS = ['fake'] # Assuming 'fake' subfolder name based on main.py's expectation
-
+    # Model-specific config
     IMAGE_SIZE = 299 # Inception-ResNetV2 typically uses 299x299 input
-    BATCH_SIZE = 32
+    # Data-related config moved to main.py/Dataset loaders: BATCH_SIZE, TRAIN_VAL_TEST_SPLIT, DATA_ROOT, REAL_DIR, FAKE_DIRS
+
+    # Training config
     LEARNING_RATE = 0.001
     NUM_EPOCHS = 25
-    TRAIN_VAL_TEST_SPLIT = [0.7, 0.15, 0.15] # 70% train, 15% validation, 15% test
-    RANDOM_SEED = 42
 
+    # System config
+    RANDOM_SEED = 42
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Define the target layer for Grad-CAM
-    # For Inception-ResNetV2 (timm), 'conv2d_7b' is a common name for the last conv layer before pooling.
-    # Inspecting timm's InceptionResnetV2 structure suggests 'conv2d_7b' or something within 'block8'.
-    # Let's try 'conv2d_7b'. If this doesn't work, printing model structure is needed.
-    TARGET_GRADCAM_LAYER = 'conv2d_7b' # Common name for the last conv before pooling in Inception-ResNetV2
+    # Grad-CAM config (Target layer name)
+    TARGET_GRADCAM_LAYER = 'conv2d_7b' # Common name for the last conv before pooling
 
-    # ImageNet mean and std for normalization (standard for models pre-trained on ImageNet)
+    # Normalization constants (used in transforms, defined in base_dataset or passed)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
 
-    # Path to save the best model weights
-    BEST_MODEL_PATH = 'best_inception_resnet_v2_model.pth' # Changed model name
-
-# Set random seeds for reproducibility
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-# --- Custom Dataset ---
-class DeepfakeDataset(Dataset):
-    """Custom Dataset for loading deepfake images."""
-    def __init__(self, file_paths, labels, transform=None):
-        self.file_paths = file_paths
-        self.labels = labels
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.file_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.file_paths[idx]
-        label = self.labels[idx]
-
-        try:
-            if not os.path.exists(img_path):
-                 return None # Return None to indicate sample failure
-
-            image = Image.open(img_path).convert('RGB')
-
-            if self.transform:
-                image = self.transform(image)
-
-            return (image, label)
-        except Exception as e:
-            # print(f"Error loading or transforming image {img_path}: {e}. Skipping.") # Keep quiet unless debugging
-            return None # Return None to indicate sample failure
-
-# Custom collate_fn to handle None values from the dataset
-def collate_fn_robust(batch):
-    """Filters out None samples from the batch and stacks valid ones."""
-    batch = [item for item in batch if item is not None]
-
-    if not batch:
-        return None, None # Return None to signal an empty batch
-
-    images = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
-
-    try:
-       images_batch = torch.stack(images)
-    except Exception as e:
-       print(f"\nError stacking images in collate_fn: {e}. Skipping batch.", file=sys.stderr)
-       return None, None # Return None if stacking fails
-
-    try:
-        labels_batch = torch.tensor(labels)
-    except Exception as e:
-       print(f"\nError stacking labels in collate_fn: {e}. Skipping batch.", file=sys.stderr)
-       return None, None # Return None if stacking fails
-
-    return images_batch, labels_batch
+    # Path to save the best model weights relative to the script's execution directory
+    BEST_MODEL_FILENAME = 'best_inception_resnet_v2_model.pth'
 
 
-# --- Data Loading and Splitting ---
-def collect_files(data_root, real_dir, fake_dirs):
-    """Collects all image file paths and their labels."""
-    if not os.path.isdir(data_root):
-         print(f"Error: Data root directory not found at {data_root}", file=sys.stderr)
-         return [], []
+print(f"InceptionResNetV2 using device: {Config.DEVICE}")
 
-    real_files = []
-    real_path = os.path.join(data_root, real_dir)
-    if os.path.isdir(real_path):
-        real_files.extend(glob.glob(os.path.join(real_path, '*.jpg')))
-        real_files.extend(glob.glob(os.path.join(real_path, '*.png'))) # Add other extensions if needed
-    else:
-        print(f"Warning: Real data directory not found at {real_path}", file=sys.stderr)
+# Set random seeds for reproducibility (called once in main)
+# def set_seed(seed):
+#     random.seed(seed)
+#     np.random.seed(seed)
+#     torch.manual_seed(seed)
+#     if torch.cuda.is_available():
+#         torch.cuda.manual_seed_all(seed)
+#         torch.backends.cudnn.deterministic = True
+#         torch.backends.cudnn.benchmark = False
 
-
-    fake_files = []
-    for fake_dir in fake_dirs:
-        fake_path = os.path.join(data_root, fake_dir)
-        if os.path.isdir(fake_path):
-            fake_files.extend(glob.glob(os.path.join(fake_path, '*.jpg')))
-            fake_files.extend(glob.glob(os.path.join(fake_path, '*.png'))) # Add other extensions
-        else:
-            print(f"Warning: Fake data directory not found at {fake_path}", file=sys.stderr)
-
-
-    real_labels = [0] * len(real_files) # 0 for real
-    fake_labels = [1] * len(fake_files) # 1 for fake
-
-    all_files = real_files + fake_files
-    all_labels = real_labels + fake_labels
-
-    print(f"\n--- Data Collection Summary ---")
-    print(f"Found {len(real_files)} real images and {len(fake_files)} fake images.")
-    print(f"Total images collected: {len(all_files)}")
-    if not all_files:
-        print("Warning: No images found in specified directories.")
-    print("-----------------------------")
-
-
-    return all_files, all_labels
-
-def create_dataloaders(all_files, all_labels, split_ratios, batch_size, image_size, seed):
-    """Splits data and creates PyTorch DataLoaders."""
-    if not all_files:
-        print("No images found. Cannot create dataloaders.")
-        return None, None, None, [], [], [], [], [], [] # Return empty lists for files/labels
-
-    # Split data
-    unique_labels, counts = np.unique(all_labels, return_counts=True)
-    min_samples_per_class = counts.min() if len(unique_labels) > 1 else 0
-    if min_samples_per_class < 2:
-         print(f"Warning: Minimum class samples ({min_samples_per_class}) is too low for reliable stratified split. Using non-stratified split.")
-         stratify_all = None
-    else:
-         stratify_all = all_labels
-
-    test_ratio = split_ratios[2]
-    if test_ratio <= 0 or test_ratio >= 1 or len(all_files) < 2:
-         print(f"Warning: Invalid test split ratio {test_ratio} or insufficient total samples ({len(all_files)}). Setting test_size to 0.")
-         test_size = 0
-         files_train_val, files_test, labels_train_val, labels_test = all_files, [], all_labels, []
-    else:
-         files_train_val, files_test, labels_train_val, labels_test = train_test_split(
-             all_files, all_labels, test_size=test_ratio, random_state=seed, stratify=stratify_all
-         )
-
-
-    train_val_sum = split_ratios[0] + split_ratios[1]
-    if len(files_train_val) == 0 or train_val_sum <= 0:
-         print("Warning: No samples for train/validation split or invalid train/val ratios. Setting train_size and val_size to 0.")
-         files_train, files_val, labels_train, labels_val = [], [], [], []
-    else:
-        relative_val_size = split_ratios[1] / train_val_sum
-        if stratify_all is not None and len(labels_train_val) > 0:
-             unique_labels_tv, counts_tv = np.unique(labels_train_val, return_counts=True)
-             min_samples_per_class_tv = counts_tv.min() if len(unique_labels_tv) > 1 else 0
-             if min_samples_per_class_tv < 2:
-                 print(f"Warning: Minimum class samples ({min_samples_per_class_tv}) in train/val set is too low for reliable stratified split. Using non-stratified split.")
-                 stratify_tv = None
-             else:
-                 stratify_tv = labels_train_val
-        else:
-             stratify_tv = None
-
-        if relative_val_size <= 0 or relative_val_size >= 1 or len(files_train_val) < 2:
-            print(f"Warning: Invalid relative validation size {relative_val_size} or insufficient samples ({len(files_train_val)}) for train/val split. Putting all samples into train.")
-            files_train, files_val, labels_train, labels_val = files_train_val, [], labels_train_val, []
-        else:
-            files_train, files_val, labels_train, labels_val = train_test_split(
-                files_train_val, labels_train_val, test_size=relative_val_size,
-                random_state=seed, stratify=stratify_tv
-            )
-
-
-    print(f"\n--- Data Split Summary ---")
-    print(f"Train samples: {len(files_train)}, Val samples: {len(files_val)}, Test samples: {len(files_test)}")
-    print("--------------------------")
-
-
-    # Define transformations
-    train_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(10),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=Config.IMAGENET_MEAN, std=Config.IMAGENET_STD),
-    ])
-
-    val_test_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=Config.IMAGENET_MEAN, std=Config.IMAGENET_STD),
-    ])
-
-    # Create datasets
-    train_dataset = DeepfakeDataset(files_train, labels_train, transform=train_transform)
-    val_dataset = DeepfakeDataset(files_val, labels_val, transform=val_test_transform)
-    test_dataset = DeepfakeDataset(files_test, labels_test, transform=val_test_transform)
-
-    # Create dataloaders (only if dataset is not empty)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=collate_fn_robust) if len(train_dataset) > 0 else None
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_fn_robust) if len(val_dataset) > 0 else None
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_fn_robust) if len(test_dataset) > 0 else None
-
-    return (train_loader, val_loader, test_loader,
-            files_train, files_val, files_test,
-            labels_train, labels_val, labels_test)
 
 # --- Model Definition ---
 def setup_model(num_classes=1):
@@ -268,260 +66,19 @@ def setup_model(num_classes=1):
 
     model = model.to(Config.DEVICE)
 
-    # --- FIX FOR GRAD-CAM INPLACE ERROR ---
-    print("\nChecking and replacing inplace ReLU modules for potential compatibility...")
-    replaced_count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, nn.ReLU) and module.inplace:
-             try:
-                 parts = name.rsplit('.', 1)
-                 if len(parts) > 1:
-                     parent_name = parts[0]
-                     child_name = parts[1]
-                     parent_module = model.get_submodule(parent_name)
-                     setattr(parent_module, child_name, nn.ReLU(inplace=False))
-                     replaced_count += 1
-             except (AttributeError, KeyError, RuntimeError) as e:
-                  pass # Silently skip if replacement is not possible
-
-    if replaced_count > 0:
-        print(f"Replaced {replaced_count} inplace ReLU modules.")
-    else:
-        print("No inplace ReLU modules found or replaced (might not be necessary or they are not addressable by name).")
-
-
-    # Verify the target layer for Grad-CAM
-    target_layer_found = False
+    # --- Check Target Layer for Grad-CAM ---
     try:
-         test_layer = model.get_submodule(Config.TARGET_GRADCAM_LAYER)
+         model.get_submodule(Config.TARGET_GRADCAM_LAYER)
          print(f"Target Grad-CAM layer '{Config.TARGET_GRADCAM_LAYER}' found.")
-         if isinstance(test_layer, nn.Conv2d) or (hasattr(test_layer, 'out_channels') and test_layer.out_channels > 0) or (hasattr(test_layer, 'c') and test_layer.c > 0):
-              print("Target layer seems suitable for Grad-CAM.")
-              target_layer_found = True
-         else:
-              print(f"Warning: Target Grad-CAM layer '{Config.TARGET_GRADCAM_LAYER}' found, but its type ({type(test_layer).__name__}) might not be ideal for standard Conv-based Grad-CAM.")
-              target_layer_found = True # Still set found=True if the module exists
     except AttributeError:
-         print(f"Warning: Target Grad-CAM layer '{Config.TARGET_GRADCAM_LAYER}' not found in the model.")
-         print("Please inspect the model structure (e.g., print(model)) to find a suitable convolutional layer name.")
-         # print(model) # Uncomment to print model structure for debugging layer names
+         print(f"Warning: Target Grad-CAM layer '{Config.TARGET_GRADCAM_LAYER}' not found in the model.", file=sys.stderr)
+         print("Grad-CAM might not work correctly for this model instance. Inspect model structure.", file=sys.stderr)
     except Exception as e:
          print(f"An unexpected error occurred while verifying target layer: {e}", file=sys.stderr)
-
-    if not target_layer_found:
-        print("Grad-CAM might not work correctly without a valid target layer.")
-
     print("-------------------------------------------------------")
 
+
     return model
-
-# --- Grad-CAM Implementation ---
-class GradCAM:
-    """Implements Grad-CAM for a PyTorch model."""
-    def __init__(self, model, target_layer_name):
-        self.model = model.eval() # Ensure model is in evaluation mode
-        self.target_layer = None
-        self.activation = None
-        self.gradient = None
-        self.hook_handles = [] # List to store hook handles
-
-        try:
-            self.target_layer = self.model.get_submodule(target_layer_name)
-        except AttributeError:
-            raise ValueError(f"Target layer '{target_layer_name}' not found in the model.")
-        except Exception as e:
-             raise RuntimeError(f"Error finding target layer '{target_layer_name}': {e}") from e
-
-
-    def _save_activation(self, module, input, output):
-        """Hook to save the output (activation) of the target layer."""
-        self.activation = output.clone().detach()
-
-    def _save_gradient(self, module, grad_input, grad_output):
-        """Hook to save the gradient w.r.t. the output of the target layer."""
-        self.gradient = grad_output[0].clone().detach()
-
-
-    def __call__(self, x, target_category=None):
-        """
-        Compute Grad-CAM for a single input image.
-        Args:
-            x (torch.Tensor): Input image tensor (shape: [1, C, H, W]). Must be on the correct device.
-            target_category (int or None): The target class index for backpropagation.
-                                            For binary classification with 1 output neuron,
-                                            backpropagate the single logit (None).
-        Returns:
-            torch.Tensor: Grad-CAM map (shape: [1, H_cam, W_cam]) on the same device as input x.
-                          Returns None if processing fails.
-        """
-        if x.ndim != 4 or x.shape[0] != 1:
-            print(f"Grad-CAM: Input tensor must have shape [1, C, H, W], but got {x.shape}. Skipping.", file=sys.stderr)
-            return None
-
-        self.remove_hooks()
-
-        try:
-            self.hook_handles.append(self.target_layer.register_forward_hook(self._save_activation))
-            self.hook_handles.append(self.target_layer.register_full_backward_hook(self._save_gradient))
-        except Exception as e:
-             print(f"Grad-CAM: Error registering hooks on target layer '{Config.TARGET_GRADCAM_LAYER}': {e}. Skipping Grad-CAM.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-
-        self.model.zero_grad()
-        self.activation = None
-        self.gradient = None
-
-        try:
-             if next(self.model.parameters()).device != x.device:
-                  self.model.to(x.device)
-             output = self.model(x)
-
-             if isinstance(output, tuple):
-                 print("Warning: Model returned a tuple output during Grad-CAM forward pass. Using only the first element.", file=sys.stderr)
-                 output = output[0]
-
-        except Exception as e:
-             print(f"Grad-CAM: Error during model forward pass: {e}. Skipping Grad-CAM.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-        try:
-            if output.numel() == 1:
-                 target_score = output.squeeze()
-            elif output.ndim == 2 and output.shape[1] > 1 and target_category is not None:
-                 target_score = output[:, target_category].squeeze()
-            elif output.ndim == 2 and output.shape[1] > 1 and target_category is None:
-                 predicted_class = output.argmax(dim=1).item()
-                 target_score = output[:, predicted_class].squeeze()
-                 print(f"Warning: Multi-class output detected but target_category is None. Using predicted class {predicted_class} for Grad-CAM.", file=sys.stderr)
-            else:
-                print(f"Grad-CAM: Unexpected model output shape {output.shape}. Skipping Grad-CAM.", file=sys.stderr)
-                self.remove_hooks()
-                return None
-
-        except Exception as e:
-             print(f"Grad-CAM: Error selecting target score for backprop: {e}. Skipping Grad-CAM.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-
-        if self.activation is None:
-             print(f"Grad-CAM: Activation was not captured. Make sure target layer '{Config.TARGET_GRADCAM_LAYER}' is correctly named and part of the model's forward pass.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-        try:
-             target_score.backward(gradient=torch.ones_like(target_score), retain_graph=True)
-        except RuntimeError as e:
-             print(f"\nGrad-CAM: RuntimeError during backward pass: {e}", file=sys.stderr)
-             print("This might be due to inplace operations or issues with graph retention.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-        except Exception as e:
-             print(f"Grad-CAM: Error during backward pass: {e}. Skipping Grad-CAM.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-
-        if self.gradient is None:
-             print("Grad-CAM: Gradient was not captured by the hook.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-        try:
-             if self.gradient.shape[0] != 1 or self.activation.shape[0] != 1:
-                  print(f"Grad-CAM: Expected batch size 1 for gradient ({self.gradient.shape[0]}) or activation ({self.activation.shape[0]}). Skipping.", file=sys.stderr)
-                  self.remove_hooks()
-                  return None
-
-             pooled_gradients = torch.mean(self.gradient, dim=[2, 3], keepdim=True)
-
-             if pooled_gradients.shape[0] != self.activation.shape[0] or pooled_gradients.shape[1] != self.activation.shape[1]:
-                  print(f"Grad-CAM: Shape mismatch between pooled gradients {pooled_gradients.shape} and activation {self.activation.shape}. Cannot compute CAM. Skipping.", file=sys.stderr)
-                  self.remove_hooks()
-                  return None
-
-             weighted_activation = self.activation * pooled_gradients
-             cam = torch.sum(weighted_activation, dim=1, keepdim=True)
-             cam = F.relu(cam)
-
-        except Exception as e:
-             print(f"Grad-CAM: Error computing CAM map: {e}. Skipping Grad-CAM.", file=sys.stderr)
-             self.remove_hooks()
-             return None
-
-        self.remove_hooks()
-        return cam
-
-    def remove_hooks(self):
-        """Removes registered hooks to clean up."""
-        for handle in self.hook_handles:
-            handle.remove()
-        self.hook_handles = []
-
-
-# --- Visualization Function ---
-def visualize_cam(original_img_pil, cam_map, title="Grad-CAM"):
-    """
-    Visualizes the Grad-CAM map overlaid on the original image.
-    Args:
-        original_img_pil (PIL.Image): The original image.
-        cam_map (np.ndarray): The Grad-CAM map (HxW numpy array).
-        title (str): Title for the plot.
-    """
-    if cam_map is None or cam_map.size == 0:
-         print("Warning: CAM map is empty or None. Cannot visualize.", file=sys.stderr)
-         return
-
-    try:
-        cam_map = np.nan_to_num(cam_map, nan=0.0, posinf=1e5, neginf=-1e5)
-        cam_map = cam_map.astype(np.float32)
-        cam_map_resized = cv2.resize(cam_map, (original_img_pil.width, original_img_pil.height), interpolation=cv2.INTER_LINEAR)
-    except Exception as e:
-        print(f"Error resizing CAM map: {e}. Skipping visualization.", file=sys.stderr)
-        return
-
-    cam_min, cam_max = cam_map_resized.min(), cam_map_resized.max()
-    if cam_max - cam_min < 1e-8:
-         cam_map_normalized = np.zeros_like(cam_map_resized)
-    else:
-        cam_map_normalized = (cam_map_resized - cam_min) / (cam_max - cam_min)
-        cam_map_normalized = np.clip(cam_map_normalized, 0, 1)
-
-    original_img_np = np.array(original_img_pil)
-
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_map_normalized), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) # Convert BGR to RGB for matplotlib
-
-    alpha = 0.5
-    original_img_float = original_img_np.astype(np.float32) / 255.0
-    heatmap_float = heatmap.astype(np.float32) / 255.0
-
-    if original_img_float.ndim == 2:
-        original_img_float = np.stack([original_img_float]*3, axis=-1)
-    elif original_img_float.ndim == 3 and original_img_float.shape[2] == 1:
-         original_img_float = np.repeat(original_img_float, 3, axis=2)
-
-    overlaid_img_float = cv2.addWeighted(original_img_float, 1 - alpha, heatmap_float, alpha, 0)
-    overlaid_img_np = np.uint8(255 * overlaid_img_float)
-
-    plt.figure(figsize=(12, 6))
-
-    plt.subplot(1, 2, 1)
-    plt.imshow(original_img_np)
-    plt.title("Original Image")
-    plt.axis('off')
-
-    plt.subplot(1, 2, 2)
-    plt.imshow(overlaid_img_np)
-    plt.title(title)
-    plt.axis('off')
-
-    plt.tight_layout()
-    plt.show()
-
 
 # --- Training Function ---
 def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, num_epochs):
@@ -589,7 +146,10 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, nu
 
 # --- Evaluation Function ---
 def evaluate(model, data_loader, criterion, device, phase="Validation"):
-    """Evaluates the model on a given data loader."""
+    """
+    Evaluates the model on a given data loader and returns raw results for metrics/plots.
+    Does NOT plot anything.
+    """
     model.eval()
     running_loss = 0.0
     all_preds_logits = []
@@ -618,6 +178,7 @@ def evaluate(model, data_loader, criterion, device, phase="Validation"):
                  eval_loop.write(f"\nError calculating loss in evaluation: {e}. Skipping batch.")
                  continue
 
+
             current_batch_size = inputs.size(0)
             running_loss += loss.item() * current_batch_size
 
@@ -632,7 +193,8 @@ def evaluate(model, data_loader, criterion, device, phase="Validation"):
 
     if not all_true_labels:
         print(f"Warning: No valid samples processed during {phase} evaluation.")
-        return 0.0, 0.0, 0.0, 0.0, 0.0, np.array([[0,0],[0,0]]), np.array([]), np.array([]), np.array([])
+        # Return empty arrays
+        return 0.0, np.array([]), np.array([])
 
     true_labels_flat = np.array(all_true_labels).flatten()
     preds_logits = np.array(all_preds_logits).flatten()
@@ -644,56 +206,42 @@ def evaluate(model, data_loader, criterion, device, phase="Validation"):
          preds_logits = preds_logits[:min_len]
          if min_len == 0:
              print(f"No valid samples after length check for {phase}. Returning defaults.", file=sys.stderr)
-             return 0.0, 0.0, 0.0, 0.0, 0.0, np.array([[0,0],[0,0]]), np.array([]), np.array([]), np.array([])
-
+             return 0.0, np.array([]), np.array([])
 
     epoch_loss = running_loss / len(true_labels_flat)
 
-    binary_preds = (preds_logits > 0).astype(int)
-    true_labels_int = true_labels_flat.astype(int)
+    # Return loss, true labels, and raw logits
+    return epoch_loss, true_labels_flat, preds_logits
 
-    # Handle cases with only one class
-    average_type = 'binary' if len(np.unique(true_labels_int)) == 2 else 'weighted'
-    zero_div = 0
-
-    accuracy = accuracy_score(true_labels_int, binary_preds)
-    precision = precision_score(true_labels_int, binary_preds, average=average_type, zero_division=zero_div)
-    recall = recall_score(true_labels_int, binary_preds, average=average_type, zero_division=zero_div)
-    f1 = f1_score(true_labels_int, binary_preds, average=average_type, zero_division=zero_div)
-
-    try:
-        conf_matrix = confusion_matrix(true_labels_int, binary_preds)
-    except Exception as e:
-        print(f"Error computing confusion matrix: {e}. Returning default.", file=sys.stderr)
-        conf_matrix = np.array([[0,0],[0,0]])
-
-
-    return epoch_loss, accuracy, precision, recall, f1, conf_matrix, true_labels_int, binary_preds, preds_logits
 
 # --- Feature Extraction Function (for t-SNE) ---
-def extract_features_from_paths(model, file_paths, labels, device, image_size):
-    """Extracts features for a list of image file paths."""
+def extract_features_from_paths(model, file_paths, device, image_size,
+                                imagenet_mean=[0.485, 0.456, 0.406], imagenet_std=[0.229, 0.224, 0.225]):
+    """
+    Extracts features for a list of image file paths using the model's feature extractor.
+    Does NOT use a DataLoader.
+    """
     model.eval()
 
     feature_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=Config.IMAGENET_MEAN, std=Config.IMAGENET_STD),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
     ])
 
     all_features = []
-    extracted_labels = []
-    extracted_paths = []
+    extracted_paths = [] # Return paths to link features back to images
 
     if not file_paths:
          print("No file paths provided for feature extraction.")
-         return np.array([]), np.array([]), []
+         return np.array([]), []
 
-    print(f"\n--- Extracting features for t-SNE from {len(file_paths)} images ---")
-    feature_loop = tqdm(zip(file_paths, labels), total=len(file_paths), desc="Extracting Features", file=sys.stdout)
+    print(f"\n--- Extracting features from {len(file_paths)} images ---")
+    # No need for labels here, we'll get labels from the corresponding list provided to main
+    feature_loop = tqdm(file_paths, total=len(file_paths), desc="Extracting Features", file=sys.stdout)
 
     with torch.no_grad():
-        for file_path, label in feature_loop:
+        for file_path in feature_loop:
             try:
                 if not os.path.exists(file_path):
                      continue
@@ -704,101 +252,96 @@ def extract_features_from_paths(model, file_paths, labels, device, image_size):
                      features = model.forward_features(img_tensor)
                      pooled_features = model.global_pool(features)
                 else:
-                    raise NotImplementedError("Feature extraction method not compatible with model structure.")
+                    raise NotImplementedError("Feature extraction method not compatible with model structure (missing forward_features or global_pool).")
 
                 all_features.append(pooled_features.cpu().numpy().flatten())
-                extracted_labels.append(label)
                 extracted_paths.append(file_path)
 
             except NotImplementedError as e:
                  print(f"\n{e}", file=sys.stderr)
                  print("Please check your timm version or model architecture.", file=sys.stderr)
-                 return np.array([]), np.array([]), []
+                 return np.array([]), [] # Stop feature extraction if the method is fundamentally incompatible
 
             except Exception as e:
                 print(f"\nError extracting feature for {file_path}: {e}. Skipping.", file=sys.stderr)
                 continue
 
     print(f"Successfully extracted features for {len(all_features)} images.")
-    return np.array(all_features), np.array(extracted_labels), extracted_paths
+    return np.array(all_features), extracted_paths
 
 
-# --- Main Entry Point (called by main.py) ---
-def test_model(dataset_path):
+# --- Main Test Function for the Model (Called by main.py) ---
+def test_model(data_loaders, data_lists, model_config):
     """
-    Runs the full training, evaluation, and visualization pipeline for Inception-ResNetV2.
-    This function is called by the project's main.py script.
+    Runs the training and evaluation pipeline for Inception-ResNetV2.
+    This function is called by main.py and uses data components prepared by a Dataset module.
 
     Args:
-        dataset_path (str): Path to the dataset folder containing 'real' and 'fake' subfolders.
+        data_loaders (tuple): (train_loader, val_loader, test_loader)
+        data_lists (tuple): (files_train, files_val, files_test, labels_train, labels_val, labels_test)
+        model_config (object): A configuration object (e.g., Config class from this file)
 
     Returns:
-        dict: A dictionary containing test metrics (accuracy, precision, recall, F1 score, confusion matrix).
+        dict: A dictionary containing results for analysis/plotting in main.py.
               Returns default zero metrics if the pipeline cannot run due to lack of data.
     """
-    print(f"\n--- Starting Inception-ResNetV2 Pipeline for Dataset: {dataset_path} ---")
-
-    Config.DATA_ROOT = dataset_path
-    set_seed(Config.RANDOM_SEED)
-
-    all_files, all_labels = collect_files(Config.DATA_ROOT, Config.REAL_DIR, Config.FAKE_DIRS)
-
-    if not all_files:
-         print("No image files found in the dataset. Exiting pipeline.")
-         return {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'conf_matrix': [[0,0],[0,0]]}
-
-    (train_loader, val_loader, test_loader,
-     files_train, files_val, files_test,
-     labels_train, labels_val, labels_test) = create_dataloaders(
-        all_files, all_labels, Config.TRAIN_VAL_TEST_SPLIT, Config.BATCH_SIZE, Config.IMAGE_SIZE, Config.RANDOM_SEED
-    )
+    train_loader, val_loader, test_loader = data_loaders
+    files_train, files_val, files_test, labels_train, labels_val, labels_test = data_lists
 
     has_training_data = train_loader is not None
     has_validation_data = val_loader is not None
     has_test_data = test_loader is not None
 
-    model = None # Initialize model outside the if blocks
-
-    if not has_training_data and not has_test_data:
-         print("No training or test data available after processing. Cannot train or test. Exiting pipeline.")
-         return {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'conf_matrix': [[0,0],[0,0]]}
-
-
-    # Always set up the model, whether training or just testing
+    # Setup model (using model-specific config like IMAGE_SIZE)
     model = setup_model(num_classes=1)
-    criterion = nn.BCEWithLogitsLoss() # Needed for both training and testing loss calc
+    criterion = nn.BCEWithLogitsLoss()
 
-
+    # --- Training ---
     if has_training_data:
-        optimizer = optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+        optimizer = optim.AdamW(model.parameters(), lr=model_config.LEARNING_RATE)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5) if has_validation_data else None
         best_val_metric = -float('inf')
+        best_model_path = model_config.BEST_MODEL_FILENAME # Use the filename from config
 
         print("\n--- Starting Training Loop ---")
-        for epoch in range(Config.NUM_EPOCHS):
-            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, Config.DEVICE, epoch, Config.NUM_EPOCHS)
+        for epoch in range(model_config.NUM_EPOCHS):
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, model_config.DEVICE, epoch, model_config.NUM_EPOCHS)
 
             if has_validation_data:
-                 val_loss, val_acc, val_precision, val_recall, val_f1, _, _, _, _ = evaluate(model, val_loader, criterion, Config.DEVICE, phase="Validation")
+                 # evaluate returns loss, true_labels, preds_logits
+                 val_loss, val_true_labels, val_preds_logits = evaluate(model, val_loader, criterion, model_config.DEVICE, phase="Validation")
 
-                 print(f"\nEpoch {epoch+1}/{Config.NUM_EPOCHS} Summary:")
+                 # Calculate standard metrics for validation from raw outputs
+                 if len(val_true_labels) > 0:
+                     val_binary_preds = (val_preds_logits > 0).astype(int)
+                     val_acc = accuracy_score(val_true_labels, val_binary_preds)
+                     val_precision = precision_score(val_true_labels, val_binary_preds, zero_division=0)
+                     val_recall = recall_score(val_true_labels, val_binary_preds, zero_division=0)
+                     val_f1 = f1_score(val_true_labels, val_binary_preds, zero_division=0)
+                     val_conf_matrix = confusion_matrix(val_true_labels, val_binary_preds).tolist()
+                 else:
+                     val_acc, val_precision, val_recall, val_f1, val_conf_matrix = 0.0, 0.0, 0.0, 0.0, [[0,0],[0,0]]
+
+
+                 print(f"\nEpoch {epoch+1}/{model_config.NUM_EPOCHS} Summary:")
                  print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
                  print(f"  Val Loss:   {val_loss:.4f}, Val Acc:   {val_acc:.4f}, Val Prec: {val_precision:.4f}, Val Rec: {val_recall:.4f}, Val F1: {val_f1:.4f}")
 
-                 current_val_metric = val_acc
+                 # Decide which metric to use for saving the best model (e.g., validation accuracy)
+                 current_val_metric = val_acc # Can change this to val_f1 etc.
 
                  if current_val_metric > best_val_metric:
                      best_val_metric = current_val_metric
                      try:
-                          torch.save(model.state_dict(), Config.BEST_MODEL_PATH)
-                          print(f"  Validation metric improved ({best_val_metric:.4f}). Saving model to {Config.BEST_MODEL_PATH}.")
+                          torch.save(model.state_dict(), best_model_path)
+                          print(f"  Validation metric improved ({best_val_metric:.4f}). Saving model to {best_model_path}.")
                      except Exception as e:
                           print(f"Error saving model: {e}", file=sys.stderr)
 
-                 scheduler.step(val_loss)
+                 scheduler.step(val_loss) # Often stepped with loss
 
             else:
-                 print(f"\nEpoch {epoch+1}/{Config.NUM_EPOCHS} Summary:")
+                 print(f"\nEpoch {epoch+1}/{model_config.NUM_EPOCHS} Summary:")
                  print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
                  print("  Skipping validation and scheduler step due to no validation data.")
 
@@ -807,249 +350,110 @@ def test_model(dataset_path):
         print("\n--- Skipping Training Loop (No training data) ---")
 
 
-    # 4. Load the best model (if saved) and evaluate on the test set
-    test_metrics_dict = {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'conf_matrix': [[0,0],[0,0]]} # Default
+    # --- Evaluation on Test Set ---
+    results = {} # Dictionary to store results to be returned to main.py
 
     if has_test_data:
         print("\n--- Evaluating on Test Set ---")
-        # Try loading the best saved model if training happened
-        if has_training_data and os.path.exists(Config.BEST_MODEL_PATH):
+        # Try loading the best saved model if training happened and a model was saved
+        best_model_path = model_config.BEST_MODEL_FILENAME
+        if has_training_data and os.path.exists(best_model_path):
              try:
-                  model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=Config.DEVICE))
-                  print(f"Loaded best model state from {Config.BEST_MODEL_PATH} for testing.")
+                  model.load_state_dict(torch.load(best_model_path, map_location=model_config.DEVICE))
+                  print(f"Loaded best model state from {best_model_path} for testing.")
              except Exception as e:
-                  print(f"Error loading best model from {Config.BEST_MODEL_PATH}: {e}. Evaluating the model from the last epoch or ImageNet pre-trained state.", file=sys.stderr)
-        elif has_training_data: # Training happened but no best model file was saved/found
-            print(f"No best model file found at {Config.BEST_MODEL_PATH}. Evaluating the model from the last epoch.")
+                  print(f"Error loading best model from {best_model_path}: {e}. Evaluating the model from the last epoch or ImageNet pre-trained state.", file=sys.stderr)
+        elif has_training_data:
+            print(f"No best model file found at {best_model_path}. Evaluating the model from the last epoch.")
         # If has_training_data is False, we evaluate the model loaded by setup_model (likely ImageNet pre-trained)
 
 
-        (test_loss, test_accuracy, test_precision, test_recall, test_f1,
-         test_conf_matrix, true_labels_test, binary_preds_test, test_preds_logits) = evaluate(
-            model, test_loader, criterion, Config.DEVICE, phase="Test"
-        )
+        # evaluate returns loss, true_labels, preds_logits
+        test_loss, test_true_labels, test_preds_logits = evaluate(model, test_loader, criterion, model_config.DEVICE, phase="Test")
 
-        if len(true_labels_test) > 0:
-            print("\n--- Test Results ---")
-            print(f"Test Loss:     {test_loss:.4f}")
-            print(f"Test Accuracy: {test_accuracy:.4f}")
-            print(f"Test Precision:{test_precision:.4f}")
-            print(f"Test Recall:   {test_recall:.4f}")
-            print(f"Test F1 Score: {test_f1:.4f}")
-            print("\nConfusion Matrix:")
-            print(test_conf_matrix)
+        # Calculate standard metrics for test from raw outputs
+        if len(test_true_labels) > 0:
+            test_binary_preds = (test_preds_logits > 0).astype(int) # Binary prediction
+            test_accuracy = accuracy_score(test_true_labels, test_binary_preds)
+            test_precision = precision_score(test_true_labels, test_binary_preds, zero_division=0)
+            test_recall = recall_score(test_true_labels, test_binary_preds, zero_division=0)
+            test_f1 = f1_score(test_true_labels, test_binary_preds, zero_division=0)
+            test_conf_matrix = confusion_matrix(test_true_labels, test_binary_preds)
 
-            # Print FP/FN counts explicitly
-            # Ensure matrix has expected shape
-            if test_conf_matrix.shape == (2, 2):
-                 tn, fp, fn, tp = test_conf_matrix.ravel()
-                 print(f"\nFalse Positives (Actual Real, Predicted Fake): {fp}")
-                 print(f"False Negatives (Actual Fake, Predicted Real): {fn}")
-                 print(f"True Positives (Actual Fake, Predicted Fake): {tp}")
-                 print(f"True Negatives (Actual Real, Predicted Real): {tn}")
-            else:
-                 print("\nConfusion matrix shape is not (2, 2). Cannot print FP/FN counts.")
+            # Store metrics in results dictionary
+            results['accuracy'] = float(test_accuracy)
+            results['precision'] = float(test_precision)
+            results['recall'] = float(test_recall)
+            results['f1'] = float(test_f1)
+            results['conf_matrix'] = test_conf_matrix.tolist() # Return as list for compatibility
+            results['test_loss'] = float(test_loss) # Include test loss
 
+            # Store raw results for plots in main.py
+            results['true_labels'] = test_true_labels.tolist() # Convert to list
+            results['binary_preds'] = test_binary_preds.tolist() # Convert to list
+            results['preds_logits'] = test_preds_logits.tolist() # Convert to list (or keep as np array if Utility expects it)
 
-            # Visualize Confusion Matrix
-            if test_conf_matrix.shape == (2, 2):
-                plt.figure(figsize=(8, 6))
-                sns.heatmap(test_conf_matrix, annot=True, fmt='d', cmap='Blues',
-                            xticklabels=['Predicted Real (0)', 'Predicted Fake (1)'],
-                            yticklabels=['True Real (0)', 'True Fake (1)'])
-                plt.xlabel('Predicted Label')
-                plt.ylabel('True Label')
-                plt.title('Confusion Matrix (Test Set)')
-                plt.show()
-            else:
-                print(f"\nCould not plot confusion matrix (expected shape (2, 2), got {test_conf_matrix.shape})")
-
-            # --- ROC AUC and Precision-Recall Curve ---
-            if len(np.unique(true_labels_test)) > 1 and len(test_preds_logits) > 1:
-                 print("\n--- Generating ROC AUC and Precision-Recall Curves ---")
-                 try:
-                     test_probabilities = torch.sigmoid(torch.tensor(test_preds_logits)).numpy()
-
-                     fpr, tpr, _ = roc_curve(true_labels_test, test_probabilities)
-                     roc_auc = auc(fpr, tpr)
-                     print(f"ROC AUC: {roc_auc:.4f}")
-
-                     precision_vals, recall_vals, _ = precision_recall_curve(true_labels_test, test_probabilities)
-                     pr_auc = average_precision_score(true_labels_test, test_probabilities)
-                     print(f"PR AUC (Average Precision): {pr_auc:.4f}")
-
-                     plt.figure(figsize=(12, 5))
-                     plt.subplot(1, 2, 1)
-                     plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
-                     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-                     plt.xlim([0.0, 1.0])
-                     plt.ylim([0.0, 1.05])
-                     plt.xlabel('False Positive Rate')
-                     plt.ylabel('True Positive Rate')
-                     plt.title('Receiver Operating Characteristic (ROC) Curve')
-                     plt.legend(loc="lower right")
-                     plt.grid(True, linestyle='--', alpha=0.6)
-
-                     plt.subplot(1, 2, 2)
-                     plt.plot(recall_vals, precision_vals, color='blue', lw=2, label=f'PR curve (AUC = {pr_auc:.4f})')
-                     plt.xlim([0.0, 1.0])
-                     plt.ylim([0.0, 1.05])
-                     plt.xlabel('Recall')
-                     plt.ylabel('Precision')
-                     plt.title('Precision-Recall Curve')
-                     plt.legend(loc="lower left")
-                     plt.grid(True, linestyle='--', alpha=0.6)
-
-                     plt.tight_layout()
-                     plt.show()
-
-                 except Exception as e:
-                     print(f"Error generating AUC/PR curves: {e}", file=sys.stderr)
-
-            elif len(true_labels_test) > 0:
-                 print(f"Skipping AUC/PR curves: Need at least 2 different labels (got {len(np.unique(true_labels_test))}) or insufficient samples (got {len(test_preds_logits)}).")
-            else:
-                 print("No test data available for AUC/PR curves.")
+            # Store test file paths and original labels for Grad-CAM/t-SNE sample selection
+            # These should correspond to the *successful* samples from the test loader if possible.
+            # A simpler approach is to return the original split lists and handle potential load errors in Utility.
+            # Let's return the original lists from create_dataloaders for simplicity.
+            results['test_file_paths'] = files_test
+            results['test_original_labels'] = labels_test
 
 
-            # --- Grad-CAM Visualization for a sample ---
-            if len(files_test) > 0 and hasattr(model, 'get_submodule') and 'TARGET_GRADCAM_LAYER' in dir(Config):
-                 try:
-                      model.get_submodule(Config.TARGET_GRADCAM_LAYER)
-                      can_run_gradcam = True
-                 except AttributeError:
-                      print(f"\nSkipping Grad-CAM visualization: Target layer '{Config.TARGET_GRADCAM_LAYER}' not found in the model.")
-                      can_run_gradcam = False
-                 except Exception as e:
-                      print(f"\nSkipping Grad-CAM visualization: Error checking target layer '{Config.TARGET_GRADCAM_LAYER}': {e}", file=sys.stderr)
-                      can_run_gradcam = False
+        else: # Case where len(test_true_labels) == 0 (no valid samples processed)
+             print("\nSkipping test evaluation metrics as no valid test samples were processed.")
+             # Return default zero metrics in results dictionary
+             results['accuracy'] = 0.0
+             results['precision'] = 0.0
+             results['recall'] = 0.0
+             results['f1'] = 0.0
+             results['conf_matrix'] = [[0,0],[0,0]]
+             results['test_loss'] = 0.0
+             results['true_labels'] = []
+             results['binary_preds'] = []
+             results['preds_logits'] = []
+             results['test_file_paths'] = []
+             results['test_original_labels'] = []
 
 
-                 if can_run_gradcam:
-                     print("\n--- Generating Grad-CAM Visualization for a sample ---")
-                     try:
-                         valid_indices = [i for i, path in enumerate(files_test) if os.path.exists(path)]
-                         if not valid_indices:
-                             print("No valid image files found in the test set for Grad-CAM.")
-                             can_run_gradcam = False
-                         else:
-                             sample_idx = random.choice(valid_indices)
-                             sample_img_path = files_test[sample_idx]
-                             sample_true_label = labels_test[sample_idx]
+        # --- Feature Extraction for t-SNE ---
+        if len(results['test_file_paths']) > 1 and len(np.unique(results['test_original_labels'])) > 1: # Need at least 2 samples & 2 classes
+             print("\n--- Extracting features for t-SNE ---")
+             # Pass original file paths and model config (for device, image_size, normalization)
+             extracted_features, extracted_paths = extract_features_from_paths(
+                 model, results['test_file_paths'], model_config.DEVICE, model_config.IMAGE_SIZE,
+                 imagenet_mean=model_config.IMAGENET_MEAN, imagenet_std=model_config.IMAGENET_STD
+             )
 
-                             original_img_pil = Image.open(sample_img_path).convert('RGB')
+             if len(extracted_features) > 1:
+                  # Need to align extracted features/paths with their original labels
+                  # Assuming the order is preserved during extraction or matching by path
+                  # Simple case: assume order is preserved.
+                  extracted_labels = [results['test_original_labels'][files_test.index(p)] for p in extracted_paths]
 
-                             test_transform_single = transforms.Compose([
-                                 transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
-                                 transforms.ToTensor(),
-                                 transforms.Normalize(mean=Config.IMAGENET_MEAN, std=Config.IMAGENET_STD),
-                             ])
-                             input_tensor = test_transform_single(original_img_pil).unsqueeze(0).to(Config.DEVICE)
+                  results['tsne_features'] = extracted_features # Keep as numpy array
+                  results['tsne_labels'] = extracted_labels # Keep as list
+                  results['tsne_paths'] = extracted_paths # Keep as list
+             else:
+                  print("Not enough features extracted for t-SNE.")
+                  results['tsne_features'] = np.array([])
+                  results['tsne_labels'] = []
+                  results['tsne_paths'] = []
+        else:
+             print("Skipping t-SNE feature extraction: Not enough test files or unique labels.")
+             results['tsne_features'] = np.array([])
+             results['tsne_labels'] = []
+             results['tsne_paths'] = []
 
-                             gradcam = None
-                             try:
-                                 gradcam = GradCAM(model, target_layer_name=Config.TARGET_GRADCAM_LAYER)
-                             except Exception as e:
-                                  print(f"Could not initialize Grad-CAM: {e}", file=sys.stderr)
-
-                             if gradcam:
-                                 try:
-                                      cam_map_tensor = gradcam(input_tensor, target_category=None)
-
-                                      if cam_map_tensor is not None:
-                                          with torch.no_grad():
-                                              output_logit = model(input_tensor).squeeze().item()
-                                          predicted_label = 1 if output_logit > 0 else 0
-                                          prediction_prob = torch.sigmoid(torch.tensor(output_logit)).item()
-
-                                          cam_map_np = cam_map_tensor.squeeze().cpu().numpy()
-
-                                          cam_title = f"Grad-CAM (Pred: {'Fake' if predicted_label else 'Real'} ({prediction_prob:.4f}), True: {'Fake' if sample_true_label else 'Real'})"
-                                          visualize_cam(original_img_pil, cam_map_np, title=cam_title)
-                                      else:
-                                           print("Grad-CAM computation failed for the sample.")
-
-                                 except Exception as e:
-                                      print(f"Error generating or visualizing Grad-CAM for sample {sample_img_path}: {e}", file=sys.stderr)
-                                 finally:
-                                      if gradcam:
-                                          gradcam.remove_hooks()
-
-                             else:
-                                  print("Grad-CAM skipped due to initialization failure.")
-
-                     except Exception as e:
-                         print(f"Error selecting or processing Grad-CAM sample: {e}", file=sys.stderr)
-
-            else:
-                 print("Skipping Grad-CAM visualization: No test files available or target layer not configured/found.")
-
-
-            # 5. Generate t-SNE Visualization (requires features)
-            if len(files_test) > 1 and len(np.unique(labels_test)) > 1:
-                 print("\n--- Generating t-SNE Visualization ---")
-
-                 all_features_tsne, all_labels_tsne, _ = extract_features_from_paths(
-                     model, files_test, labels_test, Config.DEVICE, Config.IMAGE_SIZE
-                 )
-
-                 if len(all_features_tsne) > 1 and len(np.unique(all_labels_tsne)) > 1:
-                     print(f"Running t-SNE on {len(all_features_tsne)} samples with {len(np.unique(all_labels_tsne))} classes...")
-                     try:
-                         n_samples_for_tsne = len(all_features_tsne)
-                         perplexity = min(30, n_samples_for_tsne - 1 if n_samples_for_tsne > 1 else 1)
-                         perplexity = max(5, perplexity) if n_samples_for_tsne > 5 else (n_samples_for_tsne - 1 if n_samples_for_tsne > 1 else 1)
-
-                         min_samples_for_tsne_lib = max(3 * 2, perplexity + 1) # n_components=2
-                         if n_samples_for_tsne < min_samples_for_tsne_lib:
-                             print(f"Skipping t-SNE: Too few samples ({n_samples_for_tsne}) for reliable T-SNE (requires at least {min_samples_for_tsne_lib}).")
-                         else:
-                             tsne = TSNE(n_components=2, random_state=Config.RANDOM_SEED, perplexity=perplexity, init='pca' if all_features_tsne.shape[1] > 50 else 'random')
-                             tsne_results = tsne.fit_transform(all_features_tsne)
-
-                             plt.figure(figsize=(10, 8))
-                             scatter = plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=all_labels_tsne, cmap='coolwarm', alpha=0.7)
-                             plt.colorbar(scatter, label='Label (0: Real, 1: Fake)')
-                             plt.title('t-SNE Visualization of Test Set Features')
-                             plt.xlabel('t-SNE Dimension 1')
-                             plt.ylabel('t-SNE Dimension 2')
-                             plt.grid(True, linestyle='--', alpha=0.5)
-                             plt.show()
-                     except Exception as e:
-                         print(f"Error running t-SNE: {e}", file=sys.stderr)
-
-                 elif len(all_features_tsne) > 0:
-                      if len(np.unique(all_labels_tsne)) <= 1:
-                           print(f"Skipping t-SNE visualization: Only one unique label ({len(np.unique(all_labels_tsne))}) found in extracted features.")
-                      else:
-                           print(f"Skipping t-SNE: Need at least 2 samples (got {len(all_features_tsne)}) with extracted features.")
-                 else:
-                     print("No features extracted for t-SNE.")
-
-            elif len(files_test) > 0:
-                 print(f"Skipping t-SNE visualization: Need at least 2 different labels in original test set (got {len(np.unique(labels_test))}).")
-            else:
-                print("Skipping t-SNE visualization due to no test data.")
-
-            # Update the metrics dictionary to be returned
-            test_metrics_dict = {
-                'accuracy': float(test_accuracy),
-                'precision': float(test_precision),
-                'recall': float(test_recall),
-                'f1': float(test_f1),
-                'conf_matrix': test_conf_matrix.tolist()
-            }
-
-        else: # Case where len(true_labels_test) == 0 (no valid samples in test loader)
-             print("\nSkipping test evaluation metrics, plots, Grad-CAM, and t-SNE as no valid test samples were processed.")
-             # test_metrics_dict remains the default zero metrics
 
     else: # Case when no test loader was created
-        print("\nSkipping test evaluation, confusion matrix, AUC/PR curves, t-SNE, and Grad-CAM due to no test data.")
-        # test_metrics_dict remains the default zero metrics
+        print("\nSkipping test evaluation, feature extraction for t-SNE.")
+        # results dictionary remains the default zero/empty state
 
+    print("\n--- InceptionResNetV2 Model Pipeline Section Finished ---")
 
-    print("\n--- Inception-ResNetV2 Pipeline Finished ---")
+    # Return the results dictionary for main.py to handle plotting/final output
+    return results
 
-    # Return the test metrics dictionary as required by main.py
-    return test_metrics_dict
+# Note: The __main__ block is removed as this file is imported as a module.
