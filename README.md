@@ -70,24 +70,29 @@ model_map = {
 ## Project Structure 
 ```
 ├── Detection/
-│   ├── XceptionNet.py
-│   ├── InceptionNet.py
-│   ├── ...
+│   ├── __init__.py          # Makes Detection a Python package
+│   ├── XceptionNet.py       # Placeholder for XceptionNet implementation
+│   ├── InceptionNet.py      # Placeholder for InceptionNet implementation
+│   ├── ResNet50.py          # Placeholder for ResNet50 implementation
+│   ├── EfficientNet.py      # Placeholder for EfficientNet implementation
+│   ├── MesoNet.py           # Placeholder for MesoNet implementation
+│   ├── ConvxNet.py          # Placeholder for ConvxNet implementation
+│   ├── InceptionResNetV2.py # Implementation for InceptionResNetV2 (full pipeline)
 ├── Dataset/
-|   ├── __init__.py
-|   ├── Celeb_DF_v2.py
-|   ├── Deepfake_Dataset.py
-|   ├── utils.py            
-├── main.py
-├── requirements.txt
-└── README.md
+|   ├── __init__.py          # Makes Dataset a Python package
+|   ├── Celeb_DF_v2.py       # Script to download Celeb_DF_v2 (videos)
+|   ├── Deepfake_Dataset.py  # Placeholder for Deepfake_Dataset download/loader
+|   ├── utils.py             # Placeholder for dataset-specific utilities (e.g., frame extraction)
+├── main.py                  # Main script for model selection and execution
+├── requirements.txt         # List of Python dependencies
+└── README.md                # Project description and usage instructions (This file)
 ```
 
 ---
 
 ## Datasets
 
-The following standard datasets can be used for training and testing:
+The following standard datasets can be used for training and testing with deepfake detection models. While download scripts might be provided, manual steps like video frame extraction and organizing the data into real/fake folders are typically required.
 
 | Dataset Name       | Description                                                  | Loader Script                 |
 |--------------------|--------------------------------------------------------------|-------------------------------|
