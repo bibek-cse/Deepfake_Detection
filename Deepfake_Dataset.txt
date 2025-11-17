@@ -1,0 +1,10 @@
+Deepfake Dataset:
+
+   1. Celeb DF (v2): https://www.kaggle.com/datasets/reubensuju/celeb-df-v2
+   2. OpenForensics: https://www.kaggle.com/datasets/manjilkarki/deepfake-and-real-images
+   3. DFD: https://www.kaggle.com/datasets/sanikatiwarekar/deep-fake-detection-dfd-entire-original-dataset
+   4. FaceForensics++ Dataset: https://www.kaggle.com/datasets/xdxd003/ff-c23
+   5. FaceForensics: https://www.kaggle.com/datasets/greatgamedota/faceforensics
+   6. Real and Fake Face Detection: https://www.kaggle.com/datasets/ciplab/real-and-fake-face-detection?select=real_and_fake_face
+   7. FF-GenAI: https://www.kaggle.com/datasets/argonautex/flickr-face-hq-and-genai-dataset-ff-genai
+   8. GRAVEX-200K: https://www.kaggle.com/datasets/muhammadbilal6305/200k-real-vs-ai-visuals-by-mbilal
