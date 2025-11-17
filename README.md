@@ -105,20 +105,14 @@ deepfake-detection-toolkit/
 
 The following standard datasets can be used for training and testing with deepfake detection models. While download scripts might be provided, manual steps like video frame extraction and organizing the data into real/fake folders are typically required.
 
-| Dataset Name       | Description                                                  | Loader Script                 |
-|--------------------|--------------------------------------------------------------|-------------------------------|
-| Celeb_DF_v2        | High-quality celebrity deepfakes, widely used in research.   | `Dataset/Celeb_DF_v2.py`      |
-| Deepfake_Dataset   | Real and fake face images for binary classification tasks.   | `Dataset/Deepfake_Dataset.py` |
-
-To download datasets automatically:
-
-```bash
-# Celeb_DF_v2
-python -c "from Dataset.Celeb_DF_v2 import download_celeb_df_v2; download_celeb_df_v2()"
-
-# Deepfake_Dataset
-python -c "from Dataset.Deepfake_Dataset import download_deepfake_dataset; download_deepfake_dataset()"
-```
+| Dataset Name       | Description                                                  | 
+|--------------------|--------------------------------------------------------------|
+| Celeb_DF_v2        | High-quality celebrity deepfakes, widely used in research.   | 
+| Deepfake_Dataset   | Real and fake face images for binary classification tasks.   |
+| FaceForencis++     |
+| DFDC               |
+| DeepForensics      |
+| DF-Platter         |
 
 ---
 
