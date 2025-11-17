@@ -88,11 +88,7 @@ deepfake-detection-toolkit/
 │   ├── MesoNet.py             
 │   ├── ConvxNet.py            
 │   ├── InceptionResNetV2.py   
-├── Dataset/
-│   ├── __init__.py             # To make Dataset a Python package
-│   ├── base_dataset.py         # Base classes/helpers for datasets (Optional but good)
-│   ├── Celeb_DF_v2.py          # Celeb-DF v2 specific loading/splitting
-│   ├── Deepfake_Dataset.py     
+├── Dataset_Dataset.txt    
 ├── Utility/
 │   ├── __init__.py             # To make Utility a Python package
 │   ├── plots.py                # Functions for generating plots (Conf matrix, ROC/PR, t-SNE)
